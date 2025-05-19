@@ -35,9 +35,9 @@ pico_sdk_init()
 
 # Add executable. Default name is the project name, version 0.1
 file(GLOB SOURCES
-    src/*.h
-    src/*.c
-    src/*.cpp
+    pico-src/*.h
+    pico-src/*.c
+    pico-src/*.cpp
 )
 
 add_executable(base-station-rp2040 ${SOURCES})
@@ -47,7 +47,8 @@ pico_set_program_version(base-station-rp2040 "0.1")
 
 # Add the standard include files to the build
 target_include_directories(base-station-rp2040 PUBLIC
-    ${CMAKE_CURRENT_LIST_DIR}/src
+    ${CMAKE_CURRENT_LIST_DIR}/pico-src
+    ${CMAKE_CURRENT_LIST_DIR}/pico-src/proto
 )
 
 # Add the standard library to the build
@@ -62,6 +63,7 @@ target_link_libraries(base-station-rp2040
     hardware_spi
 )
 
+pico_enable_stdio_uart(base-station-rp2040 0)
 pico_enable_stdio_usb(base-station-rp2040 1)
 pico_add_extra_outputs(base-station-rp2040)
 

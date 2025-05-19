@@ -4,7 +4,7 @@
 #include "hardware/spi.h"
 #include "hardware/uart.h"
 #include "bsp/board_api.h"
- 
+
 #include "st7789.h"
  
 #include "tusb.h"
@@ -18,12 +18,16 @@
 #define BUTTON2_PIN 14
  
 #define UART_ID     uart0
+#define UART_IRQ_ID UART0_IRQ
 #define BAUD_RATE   9600
 #define UART_TX_PIN 0
 #define UART_RX_PIN 1
 #define DATA_BITS   8 // 8N1
 #define PARITY      UART_PARITY_NONE
 #define STOP_BITS   1
+
+#define USB_ENDPOINT_DEBUG 0
+#define USB_ENDPOINT_DATA 1
  
 typedef enum _transceiver_mode {
     RECEIVER,
@@ -46,6 +50,89 @@ const uint16_t lcd_height = 135;
  
 uint8_t buffer[128];
 transceiver_mode mode = RECEIVER;
+
+const uint8_t RX_START_BYTE = 0xFF;
+const uint8_t RX_END_BYTE = 0xEE;
+const uint32_t RX_BUFFER_SIZE = 64;
+const uint32_t RX_FRAME_SIZE = 128;
+
+bool rx_found_start = false;
+uint8_t rx_buffer[RX_BUFFER_SIZE];
+uint32_t current_frame_byte_index = 0;
+
+void on_uart_rx() {
+    while (uart_is_readable(UART_ID)) {
+        tud_cdc_n_write_char(USB_ENDPOINT_DATA, uart_getc(UART_ID));
+    }
+}
+
+//void read_next_uart_byte() {
+    // if (uart_is_readable_within_us(UART_ID, 10)) {
+
+    //     while (uart_is_readable_within_us(UART_ID, 100))
+    //     {
+    //         current_frame_byte_index++;
+    //         rx_buffer[current_frame_byte_index] = uart_getc(UART_ID);
+
+    //         if ()
+    //         tud_cdc_n_write_char(USB_ENDPOINT_DATA, received_char);
+
+
+    //         printf("[printf] Data received - BYTE reception \r\n");
+    //         st7789_put(0x0FFF);
+    //     }
+    //     tud_cdc_n_write_flush(USB_ENDPOINT_DATA);
+
+    // }
+
+//     if (!uart_is_readable_within_us(UART_ID, 10)) {
+//         return;
+//     }
+
+//     uint8_t rx_byte = uart_getc(UART_ID);
+
+//     // Write incoming byte to array
+//     rx_buffer[current_frame_byte_index] = rx_byte;
+
+//     if (!rx_found_start) {
+//         if (rx_buffer[current_frame_byte_index] == RX_START_BYTE) {
+//             // 1 variant - found start byte
+//             rx_found_start = 1;
+//             current_frame_byte_index = 1;
+//             rx_buffer[0] = RX_START_BYTE;
+//         } else {
+//             // 2 variant - not found start byte yet
+//             current_frame_byte_index++;
+//         }
+
+//         HAL_UART_Receive_IT(&UART_PORT_RS485_SW, &rx_byte, 1);
+//         return;
+//     }
+
+//     current_frame_byte_index++;
+
+//     // Make sure there is no overflow in array size
+//     if (current_frame_byte_index > RX_BUFFER_SIZE) {
+//         current_frame_byte_index = 0;
+//     }
+
+//     if (current_frame_byte_index == RX_FRAME_SIZE) {
+//         if (rx_buffer[RX_FRAME_SIZE - 1] == RX_END_BYTE) {
+//             // 3 variant - found end byte
+//             intRxCplt_SW = 1;
+//         }
+//         // 4 variant - not found start byte
+
+//         current_frame_byte_index = 0;
+//         rx_found_start = 0;
+
+//         HAL_UART_Receive_IT(&UART_PORT_RS485_SW, &rx_byte, 1);
+//         return;
+//     }
+
+//     // 5 variant - byte between start and end
+//     HAL_UART_Receive_IT(&UART_PORT_RS485_SW, &rx_byte, 1);
+// }
  
 int main()
 {
@@ -73,13 +160,18 @@ int main()
     gpio_put(LORA_MODE1_PIN, 0);
  
     // ---------------------- LoRa UART -------------------------
+    gpio_set_function(UART_TX_PIN, UART_FUNCSEL_NUM(UART_ID, UART_TX_PIN));
+    gpio_set_function(UART_RX_PIN, UART_FUNCSEL_NUM(UART_ID, UART_RX_PIN));
+
     uart_init(UART_ID, BAUD_RATE);
     uart_set_hw_flow(UART_ID, false, false);
     uart_set_format(UART_ID, DATA_BITS, STOP_BITS, PARITY);
-    uart_set_fifo_enabled(UART_ID, true);
- 
-    gpio_set_function(UART_TX_PIN, UART_FUNCSEL_NUM(UART_ID, UART_TX_PIN));
-    gpio_set_function(UART_RX_PIN, UART_FUNCSEL_NUM(UART_ID, UART_RX_PIN));
+    uart_set_fifo_enabled(UART_ID, false);
+    uart_set_irq_enables(UART_ID, true, false);
+
+    irq_set_exclusive_handler(UART0_IRQ, on_uart_rx);
+    irq_set_enabled(UART0_IRQ, true);
+    uart_set_irq_enables(UART_ID, true, false);
  
     // ---------------------- Buttons -------------------------
     gpio_init(BUTTON1_PIN);
@@ -129,17 +221,7 @@ int main()
                 printf("[printf] Periodic echo - reception \r\n");
             }
 
-            if (uart_is_readable_within_us(UART_ID, 1000)) {
-                tud_cdc_n_write_str(1, "Reception: ");
-                while (uart_is_readable_within_us(UART_ID, 10))
-                {
-                    char received_char = uart_getc(UART_ID);
-                    tud_cdc_n_write_char(1, received_char);
-                    printf("[printf] Data received - BYTE reception \r\n");
-                    st7789_put(0x0FFF);
-                }
-                tud_cdc_n_write_flush(1);
-            }
+            //read_next_uart_byte();
 
         }
  
@@ -151,9 +233,9 @@ int main()
  
                 sprintf((char *)buffer, "New message \r\n\0");
 
-                tud_cdc_n_write_str(1, "Transmission: ");
-                tud_cdc_n_write_str(1, (const char*) buffer);
-                tud_cdc_n_write_flush(1);
+                tud_cdc_n_write_str(USB_ENDPOINT_DATA, "Transmission: ");
+                tud_cdc_n_write_str(USB_ENDPOINT_DATA, (const char*) buffer);
+                tud_cdc_n_write_flush(USB_ENDPOINT_DATA);
                 uart_puts(UART_ID, (const char*) buffer);
                 st7789_put(0xFFF0);
 
@@ -161,7 +243,7 @@ int main()
                 // {
                 //     uart_putc(UART_ID, buffer[i]);
                 //     st7789_put(0xFFF0);
-                //     tud_cdc_n_write_char(1, buffer[i]); //
+                //     tud_cdc_n_write_char(USB_ENDPOINT_DATA, buffer[i]); //
                 //     tud_cdc_write_flush();
                 // }
 
