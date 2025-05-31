@@ -2,6 +2,6 @@
     path = pico-sdk
     url = "https://github.com/raspberrypi/pico-sdk.git"
 
-[submodule "capnp-proto"]
-    path = pc-src/proto
+[submodule "pc-src/capnp-proto"]
+    path = pc-src/capnp-proto
     url = "https://github.com/hydrogreenpollub/capnp-proto.git"
