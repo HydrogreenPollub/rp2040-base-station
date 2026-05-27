@@ -108,7 +108,10 @@ void st7789_init(const struct st7789_config *config, uint16_t width, uint16_t he
     }
     gpio_init(st7789_cfg.gpio_dc);
     gpio_init(st7789_cfg.gpio_rst);
-    gpio_init(st7789_cfg.gpio_bl);
+    if (st7789_cfg.gpio_bl > -1)
+    {
+        gpio_init(st7789_cfg.gpio_bl);
+    }
 
     if (st7789_cfg.gpio_cs > -1)
     {
@@ -116,7 +119,10 @@ void st7789_init(const struct st7789_config *config, uint16_t width, uint16_t he
     }
     gpio_set_dir(st7789_cfg.gpio_dc, GPIO_OUT);
     gpio_set_dir(st7789_cfg.gpio_rst, GPIO_OUT);
-    gpio_set_dir(st7789_cfg.gpio_bl, GPIO_OUT);
+    if (st7789_cfg.gpio_bl > -1)
+    {
+        gpio_set_dir(st7789_cfg.gpio_bl, GPIO_OUT);
+    }
 
     if (st7789_cfg.gpio_cs > -1)
     {
@@ -147,10 +153,10 @@ void st7789_init(const struct st7789_config *config, uint16_t width, uint16_t he
     // - Line Address Order            = LCD Refresh Top to Bottom
     // - RGB/BGR Order                 = RGB
     // - Display Data Latch Data Order = LCD Refresh Left to Right
-    st7789_cmd(0x36, (uint8_t[]) { 0x00 }, 1);
+    st7789_cmd(0x36, &st7789_cfg.madctl, 1);
 
-    st7789_caset(0, width);
-    st7789_raset(0, height);
+    st7789_caset(st7789_cfg.x_offset, st7789_cfg.x_offset + width - 1);
+    st7789_raset(st7789_cfg.y_offset, st7789_cfg.y_offset + height - 1);
 
     // INVON (21h): Display Inversion On
     st7789_cmd(0x21, NULL, 0);
@@ -164,7 +170,10 @@ void st7789_init(const struct st7789_config *config, uint16_t width, uint16_t he
     st7789_cmd(0x29, NULL, 0);
     sleep_ms(10);
 
-    gpio_put(st7789_cfg.gpio_bl, 1);
+    if (st7789_cfg.gpio_bl > -1)
+    {
+        gpio_put(st7789_cfg.gpio_bl, 1);
+    }
 }
 
 void st7789_ramwr()
@@ -228,10 +237,135 @@ void st7789_fill(uint16_t pixel)
     }
 }
 
+void st7789_fill_rect(uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint16_t pixel)
+{
+    if (x >= st7789_width || y >= st7789_height)
+    {
+        return;
+    }
+
+    if (x + width > st7789_width)
+    {
+        width = st7789_width - x;
+    }
+    if (y + height > st7789_height)
+    {
+        height = st7789_height - y;
+    }
+
+    st7789_caset(st7789_cfg.x_offset + x, st7789_cfg.x_offset + x + width - 1);
+    st7789_raset(st7789_cfg.y_offset + y, st7789_cfg.y_offset + y + height - 1);
+    for (uint32_t i = 0; i < (uint32_t)width * height; i++)
+    {
+        st7789_put(pixel);
+    }
+}
+
+static const uint8_t *glyph_rows(char c)
+{
+    static const uint8_t space[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    static const uint8_t minus[] = { 0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00 };
+    static const uint8_t dot[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x0c };
+    static const uint8_t slash[] = { 0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10 };
+    static const uint8_t colon[] = { 0x00, 0x0c, 0x0c, 0x00, 0x0c, 0x0c, 0x00 };
+    static const uint8_t alnum[][7] = {
+        { 0x0e, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0e },
+        { 0x04, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x0e },
+        { 0x0e, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1f },
+        { 0x1f, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0e },
+        { 0x02, 0x06, 0x0a, 0x12, 0x1f, 0x02, 0x02 },
+        { 0x1f, 0x10, 0x1e, 0x01, 0x01, 0x11, 0x0e },
+        { 0x06, 0x08, 0x10, 0x1e, 0x11, 0x11, 0x0e },
+        { 0x1f, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08 },
+        { 0x0e, 0x11, 0x11, 0x0e, 0x11, 0x11, 0x0e },
+        { 0x0e, 0x11, 0x11, 0x0f, 0x01, 0x02, 0x0c },
+        { 0x0e, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11 },
+        { 0x1e, 0x11, 0x11, 0x1e, 0x11, 0x11, 0x1e },
+        { 0x0e, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0e },
+        { 0x1e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1e },
+        { 0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x1f },
+        { 0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x10 },
+        { 0x0e, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0f },
+        { 0x11, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11 },
+        { 0x0e, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0e },
+        { 0x07, 0x02, 0x02, 0x02, 0x12, 0x12, 0x0c },
+        { 0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11 },
+        { 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1f },
+        { 0x11, 0x1b, 0x15, 0x15, 0x11, 0x11, 0x11 },
+        { 0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11 },
+        { 0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e },
+        { 0x1e, 0x11, 0x11, 0x1e, 0x10, 0x10, 0x10 },
+        { 0x0e, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0d },
+        { 0x1e, 0x11, 0x11, 0x1e, 0x14, 0x12, 0x11 },
+        { 0x0f, 0x10, 0x10, 0x0e, 0x01, 0x01, 0x1e },
+        { 0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04 },
+        { 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e },
+        { 0x11, 0x11, 0x11, 0x11, 0x11, 0x0a, 0x04 },
+        { 0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0a },
+        { 0x11, 0x11, 0x0a, 0x04, 0x0a, 0x11, 0x11 },
+        { 0x11, 0x11, 0x0a, 0x04, 0x04, 0x04, 0x04 },
+        { 0x1f, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1f },
+    };
+
+    if (c >= 'a' && c <= 'z')
+    {
+        c -= 'a' - 'A';
+    }
+    if (c >= '0' && c <= '9')
+    {
+        return alnum[c - '0'];
+    }
+    if (c >= 'A' && c <= 'Z')
+    {
+        return alnum[10 + c - 'A'];
+    }
+    if (c == '-')
+    {
+        return minus;
+    }
+    if (c == '.')
+    {
+        return dot;
+    }
+    if (c == '/')
+    {
+        return slash;
+    }
+    if (c == ':')
+    {
+        return colon;
+    }
+    return space;
+}
+
+static void st7789_draw_char(uint16_t x, uint16_t y, char c, uint16_t fg, uint16_t bg, uint8_t scale)
+{
+    const uint8_t *rows = glyph_rows(c);
+
+    for (uint8_t row = 0; row < 7; row++)
+    {
+        for (uint8_t col = 0; col < 5; col++)
+        {
+            uint16_t color = (rows[row] & (1u << (4 - col))) ? fg : bg;
+            st7789_fill_rect(x + col * scale, y + row * scale, scale, scale, color);
+        }
+    }
+}
+
+void st7789_draw_text(uint16_t x, uint16_t y, const char *text, uint16_t fg, uint16_t bg, uint8_t scale)
+{
+    while (*text)
+    {
+        st7789_draw_char(x, y, *text, fg, bg, scale);
+        x += 6 * scale;
+        text++;
+    }
+}
+
 void st7789_set_cursor(uint16_t x, uint16_t y)
 {
-    st7789_caset(x, st7789_width);
-    st7789_raset(y, st7789_height);
+    st7789_caset(st7789_cfg.x_offset + x, st7789_cfg.x_offset + st7789_width - 1);
+    st7789_raset(st7789_cfg.y_offset + y, st7789_cfg.y_offset + st7789_height - 1);
 }
 
 void st7789_vertical_scroll(uint16_t row)

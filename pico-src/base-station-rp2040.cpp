@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 #include "pico/stdlib.h"
 #include "pico/stdio.h"
 #include "hardware/spi.h"
@@ -14,6 +15,7 @@
 #define LORA_MODE0_PIN 2
 #define LORA_MODE1_PIN 3
 
+#define LCD_BL_PIN -1
 #define BUTTON1_PIN 13
 #define BUTTON2_PIN 14
  
@@ -28,6 +30,11 @@
 
 #define USB_ENDPOINT_DEBUG 0
 #define USB_ENDPOINT_DATA 1
+
+#define LCD_BLACK 0x0000
+#define LCD_WHITE 0xffff
+#define LCD_GREEN 0x07e0
+#define LCD_BLUE  0x001f
  
 typedef enum _transceiver_mode {
     RECEIVER,
@@ -41,7 +48,10 @@ const struct st7789_config lcd_config = {
     .gpio_cs = 9,
     .gpio_dc = 8,
     .gpio_rst = 12,
-    .gpio_bl = 13,
+    .gpio_bl = LCD_BL_PIN,
+    .madctl = 0x60,
+    .x_offset = 40,
+    .y_offset = 53,
 };
  
 // LCD rotation {0x60, 240, 135, 40, 53},
@@ -53,86 +63,219 @@ transceiver_mode mode = RECEIVER;
 
 const uint8_t RX_START_BYTE = 0xFF;
 const uint8_t RX_END_BYTE = 0xEE;
-const uint32_t RX_BUFFER_SIZE = 64;
-const uint32_t RX_FRAME_SIZE = 128;
+const uint32_t RX_PAYLOAD_SIZE = 160;
+const uint32_t UART_RING_SIZE = 256;
+const uint32_t RX_RATE_WINDOW_SECONDS = 10;
+const uint32_t CAPNP_DATA_OFFSET = 16;
+const uint32_t TS_DATA_TIME_SECONDS_OFFSET = 0;
+const uint32_t TS_DATA_FUEL_CELL_OUTPUT_VOLTAGE_INDEX = 6;
+const uint16_t TEXT_MARGIN_X = 6;
+const uint16_t RATE_TEXT_Y = 12;
+const uint16_t VALUE_TEXT_X = 6;
+const uint16_t FC_V_TEXT_Y = 52;
+const uint16_t TIME_TEXT_Y = 82;
+const uint16_t MODE_ROW_Y = 118;
+const uint16_t MODE_TEXT_Y = 121;
+const uint16_t RECEIVER_MODE_TEXT_X = 6;
+const uint16_t TRANSMITTER_MODE_TEXT_X = 138;
+const uint32_t BUTTON_DEBOUNCE_MS = 50;
 
 bool rx_found_start = false;
-uint8_t rx_buffer[RX_BUFFER_SIZE];
+uint8_t rx_buffer[RX_PAYLOAD_SIZE];
 uint32_t current_frame_byte_index = 0;
+volatile uint8_t uart_ring[UART_RING_SIZE];
+volatile uint32_t uart_ring_read_index = 0;
+volatile uint32_t uart_ring_write_index = 0;
+volatile uint32_t uart_ring_dropped_bytes = 0;
+uint32_t rx_bytes_this_second = 0;
+uint32_t rx_bytes_window[RX_RATE_WINDOW_SECONDS] = { 0 };
+uint32_t rx_bytes_window_index = 0;
+uint32_t rx_bytes_last_10s = 0;
+float latest_fuel_cell_voltage = 0.0f;
+uint64_t latest_frame_time_seconds = 0;
+bool latest_frame_valid = false;
 
 void on_uart_rx() {
     while (uart_is_readable(UART_ID)) {
-        tud_cdc_n_write_char(USB_ENDPOINT_DATA, uart_getc(UART_ID));
+        uint32_t next_write_index = (uart_ring_write_index + 1) % UART_RING_SIZE;
+        uint8_t byte = uart_getc(UART_ID);
+
+        if (next_write_index == uart_ring_read_index)
+        {
+            uart_ring_dropped_bytes++;
+            continue;
+        }
+
+        uart_ring[uart_ring_write_index] = byte;
+        uart_ring_write_index = next_write_index;
     }
 }
 
-//void read_next_uart_byte() {
-    // if (uart_is_readable_within_us(UART_ID, 10)) {
+bool uart_ring_pop(uint8_t *byte)
+{
+    if (uart_ring_read_index == uart_ring_write_index)
+    {
+        return false;
+    }
 
-    //     while (uart_is_readable_within_us(UART_ID, 100))
-    //     {
-    //         current_frame_byte_index++;
-    //         rx_buffer[current_frame_byte_index] = uart_getc(UART_ID);
+    *byte = uart_ring[uart_ring_read_index];
+    uart_ring_read_index = (uart_ring_read_index + 1) % UART_RING_SIZE;
+    return true;
+}
 
-    //         if ()
-    //         tud_cdc_n_write_char(USB_ENDPOINT_DATA, received_char);
+float read_le_float(const uint8_t *data)
+{
+    float value;
+    memcpy(&value, data, sizeof(value));
+    return value;
+}
 
+uint64_t read_le_u64(const uint8_t *data)
+{
+    uint64_t value;
+    memcpy(&value, data, sizeof(value));
+    return value;
+}
 
-    //         printf("[printf] Data received - BYTE reception \r\n");
-    //         st7789_put(0x0FFF);
-    //     }
-    //     tud_cdc_n_write_flush(USB_ENDPOINT_DATA);
+float read_ts_data_float(uint32_t field_index)
+{
+    return read_le_float(&rx_buffer[CAPNP_DATA_OFFSET + field_index * sizeof(float)]);
+}
 
-    // }
+uint64_t read_ts_data_u64(uint32_t field_offset)
+{
+    return read_le_u64(&rx_buffer[CAPNP_DATA_OFFSET + field_offset]);
+}
 
-//     if (!uart_is_readable_within_us(UART_ID, 10)) {
-//         return;
-//     }
+bool process_telemetry_byte(uint8_t byte)
+{
+    if (!rx_found_start)
+    {
+        rx_found_start = byte == RX_START_BYTE;
+        current_frame_byte_index = 0;
+        return false;
+    }
 
-//     uint8_t rx_byte = uart_getc(UART_ID);
+    if (current_frame_byte_index < RX_PAYLOAD_SIZE)
+    {
+        rx_buffer[current_frame_byte_index++] = byte;
+        return false;
+    }
 
-//     // Write incoming byte to array
-//     rx_buffer[current_frame_byte_index] = rx_byte;
+    bool frame_complete = false;
+    if (byte == RX_END_BYTE)
+    {
+        latest_frame_time_seconds = read_ts_data_u64(TS_DATA_TIME_SECONDS_OFFSET);
+        latest_fuel_cell_voltage = read_ts_data_float(TS_DATA_FUEL_CELL_OUTPUT_VOLTAGE_INDEX);
+        latest_frame_valid = true;
+        frame_complete = true;
+    }
 
-//     if (!rx_found_start) {
-//         if (rx_buffer[current_frame_byte_index] == RX_START_BYTE) {
-//             // 1 variant - found start byte
-//             rx_found_start = 1;
-//             current_frame_byte_index = 1;
-//             rx_buffer[0] = RX_START_BYTE;
-//         } else {
-//             // 2 variant - not found start byte yet
-//             current_frame_byte_index++;
-//         }
+    rx_found_start = false;
+    current_frame_byte_index = 0;
+    return frame_complete;
+}
 
-//         HAL_UART_Receive_IT(&UART_PORT_RS485_SW, &rx_byte, 1);
-//         return;
-//     }
+void format_fixed_1(char *buffer, size_t buffer_size, float value)
+{
+    int scaled = (int)(value * 10.0f);
+    int whole = scaled / 10;
+    int frac = scaled % 10;
 
-//     current_frame_byte_index++;
+    if (frac < 0)
+    {
+        frac = -frac;
+    }
 
-//     // Make sure there is no overflow in array size
-//     if (current_frame_byte_index > RX_BUFFER_SIZE) {
-//         current_frame_byte_index = 0;
-//     }
+    snprintf(buffer, buffer_size, "%d.%d", whole, frac);
+}
 
-//     if (current_frame_byte_index == RX_FRAME_SIZE) {
-//         if (rx_buffer[RX_FRAME_SIZE - 1] == RX_END_BYTE) {
-//             // 3 variant - found end byte
-//             intRxCplt_SW = 1;
-//         }
-//         // 4 variant - not found start byte
+void format_time_of_day(char *buffer, size_t buffer_size, uint64_t unix_seconds)
+{
+    uint32_t seconds_in_day = unix_seconds % (24 * 60 * 60);
+    uint32_t hours = seconds_in_day / (60 * 60);
+    uint32_t minutes = (seconds_in_day / 60) % 60;
+    uint32_t seconds = seconds_in_day % 60;
 
-//         current_frame_byte_index = 0;
-//         rx_found_start = 0;
+    snprintf(buffer, buffer_size, "%02lu:%02lu:%02lu", (unsigned long)hours, (unsigned long)minutes,
+        (unsigned long)seconds);
+}
 
-//         HAL_UART_Receive_IT(&UART_PORT_RS485_SW, &rx_byte, 1);
-//         return;
-//     }
+uint32_t update_rx_bytes_window()
+{
+    rx_bytes_last_10s -= rx_bytes_window[rx_bytes_window_index];
+    rx_bytes_window[rx_bytes_window_index] = rx_bytes_this_second;
+    rx_bytes_last_10s += rx_bytes_this_second;
+    rx_bytes_this_second = 0;
+    rx_bytes_window_index = (rx_bytes_window_index + 1) % RX_RATE_WINDOW_SECONDS;
 
-//     // 5 variant - byte between start and end
-//     HAL_UART_Receive_IT(&UART_PORT_RS485_SW, &rx_byte, 1);
-// }
+    return rx_bytes_last_10s;
+}
+
+void log_reception_status(uint32_t bytes_per_10s)
+{
+    char time_value[16];
+
+    if (latest_frame_valid)
+    {
+        format_time_of_day(time_value, sizeof(time_value), latest_frame_time_seconds);
+        printf("[printf] Periodic echo - reception - RX_BYTES: %lu B/10S, TIME: %s\r\n",
+            (unsigned long)bytes_per_10s, time_value);
+    }
+    else
+    {
+        printf("[printf] Periodic echo - reception - RX_BYTES: %lu B/10S\r\n", (unsigned long)bytes_per_10s);
+    }
+}
+
+void draw_mode_row()
+{
+    st7789_fill_rect(0, MODE_ROW_Y, lcd_width, 17, LCD_BLACK);
+    if (mode == RECEIVER)
+    {
+        st7789_draw_text(RECEIVER_MODE_TEXT_X, MODE_TEXT_Y, "RECEIVER MODE", LCD_GREEN, LCD_BLACK, 1);
+    }
+    else
+    {
+        st7789_draw_text(TRANSMITTER_MODE_TEXT_X, MODE_TEXT_Y, "TRANSMITTER MODE", LCD_GREEN, LCD_BLACK, 1);
+    }
+}
+
+void clear_telemetry_values()
+{
+    st7789_fill_rect(0, 46, lcd_width, 70, LCD_BLACK);
+    latest_frame_valid = false;
+}
+
+void redraw_status(uint32_t bytes_per_10s)
+{
+    char line[32];
+    char value[16];
+
+    st7789_fill_rect(0, 0, lcd_width, 34, LCD_BLACK);
+    st7789_fill_rect(0, 34, lcd_width, 4, LCD_GREEN);
+    snprintf(line, sizeof(line), "RX_BYTES: %lu B/10S", (unsigned long)bytes_per_10s);
+    st7789_draw_text(TEXT_MARGIN_X, RATE_TEXT_Y, line, LCD_WHITE, LCD_BLACK, 1);
+
+    st7789_fill_rect(0, 46, lcd_width, 70, LCD_BLACK);
+    if (mode == RECEIVER && latest_frame_valid)
+    {
+        format_fixed_1(value, sizeof(value), latest_fuel_cell_voltage);
+        snprintf(line, sizeof(line), "FC_V: %s V", value);
+        st7789_draw_text(VALUE_TEXT_X, FC_V_TEXT_Y, line, LCD_WHITE, LCD_BLACK, 2);
+
+        format_time_of_day(value, sizeof(value), latest_frame_time_seconds);
+        snprintf(line, sizeof(line), "TIME: %s", value);
+        st7789_draw_text(VALUE_TEXT_X, TIME_TEXT_Y, line, LCD_WHITE, LCD_BLACK, 2);
+    }
+    else if (mode == RECEIVER)
+    {
+        st7789_draw_text(VALUE_TEXT_X, FC_V_TEXT_Y, "FC_V: --- V", LCD_BLUE, LCD_BLACK, 2);
+        st7789_draw_text(VALUE_TEXT_X, TIME_TEXT_Y, "TIME: --:--:--", LCD_BLUE, LCD_BLACK, 2);
+    }
+
+    draw_mode_row();
+}
  
 int main()
 {
@@ -147,8 +290,6 @@ int main()
         board_init_after_tusb();
     }
  
-    // let pico sdk use the first cdc interface for std io
-    //stdio_init_all();
     stdio_usb_init();
 
     // ---------------------- LoRa Mode -------------------------
@@ -184,75 +325,97 @@ int main()
  
     // ---------------------- Screen -------------------------
     st7789_init(&lcd_config, lcd_width, lcd_height);
-    st7789_fill(0xffff); // make screen white
-    st7789_set_cursor(100, 100);
+    st7789_fill(LCD_BLACK);
+    redraw_status(0);
+    bool button1_was_released = true;
+    bool button2_was_released = true;
+    absolute_time_t last_button_event_time = nil_time;
+    bool pending_ui_refresh = false;
  
-    uint64_t delay = 0;
+    absolute_time_t next_status_update = make_timeout_time_ms(1000);
+    absolute_time_t next_transmit_update = make_timeout_time_ms(1000);
     while (1)
     {
         // tinyusb device task
         tud_task();
- 
-        if (gpio_get(BUTTON1_PIN) == false)
+
+        uint8_t rx_byte;
+        while (uart_ring_pop(&rx_byte))
         {
-            delay = 0;
-            mode = RECEIVER;
-            st7789_fill(0xffff);
-            st7789_set_cursor(100, 100);
-            printf("[printf] New mode: receiver \r\n");
-        }
- 
-        if (gpio_get(BUTTON2_PIN) == false)
-        {
-            delay = 0;
-            mode = TRANSMITTER;
-            st7789_fill(0x0000);
-            st7789_set_cursor(100, 100);
-            printf("[printf] New mode: transmitter \r\n");
-        }
- 
-        delay++;
- 
-        if (mode == RECEIVER)
-        {
-            if (delay > 1000000)
+            tud_cdc_n_write_char(USB_ENDPOINT_DATA, rx_byte);
+            rx_bytes_this_second++;
+            if (process_telemetry_byte(rx_byte))
             {
-                delay = 0;
-                printf("[printf] Periodic echo - reception \r\n");
+                pending_ui_refresh = true;
             }
+        }
+        tud_cdc_n_write_flush(USB_ENDPOINT_DATA);
+ 
+        bool button1_released = gpio_get(BUTTON1_PIN);
+        bool button2_released = gpio_get(BUTTON2_PIN);
 
-            //read_next_uart_byte();
+        // React only to press edge (released -> pressed), not while held.
+        bool debounce_elapsed = is_nil_time(last_button_event_time) ||
+            absolute_time_diff_us(last_button_event_time, get_absolute_time()) >= (int64_t)BUTTON_DEBOUNCE_MS * 1000;
 
+        if (button1_was_released && !button1_released && debounce_elapsed)
+        {
+            if (mode != RECEIVER)
+            {
+                mode = RECEIVER;
+                pending_ui_refresh = true;
+                next_status_update = make_timeout_time_ms(1000);
+                printf("[printf] New mode: receiver \r\n");
+            }
+            last_button_event_time = get_absolute_time();
         }
  
+        if (button2_was_released && !button2_released && debounce_elapsed)
+        {
+            if (mode != TRANSMITTER)
+            {
+                mode = TRANSMITTER;
+                clear_telemetry_values();
+                pending_ui_refresh = true;
+                next_transmit_update = make_timeout_time_ms(1000);
+                printf("[printf] New mode: transmitter \r\n");
+            }
+            last_button_event_time = get_absolute_time();
+        }
+
+        button1_was_released = button1_released;
+        button2_was_released = button2_released;
+ 
+        if (absolute_time_diff_us(get_absolute_time(), next_status_update) <= 0)
+        {
+            uint32_t bytes_per_10s = update_rx_bytes_window();
+            pending_ui_refresh = true;
+            if (mode == RECEIVER)
+            {
+                log_reception_status(bytes_per_10s);
+            }
+            next_status_update = make_timeout_time_ms(1000);
+        }
+
+        if (pending_ui_refresh)
+        {
+            redraw_status(rx_bytes_last_10s);
+            pending_ui_refresh = false;
+        }
+
         if (mode == TRANSMITTER)
         {
-            if (delay > 1000000)
+            if (absolute_time_diff_us(get_absolute_time(), next_transmit_update) <= 0)
             {
-                delay = 0;
- 
-                sprintf((char *)buffer, "New message \r\n\0");
+                next_transmit_update = make_timeout_time_ms(1000);
+
+                snprintf((char *)buffer, sizeof(buffer), "New message \r\n");
 
                 tud_cdc_n_write_str(USB_ENDPOINT_DATA, "Transmission: ");
                 tud_cdc_n_write_str(USB_ENDPOINT_DATA, (const char*) buffer);
                 tud_cdc_n_write_flush(USB_ENDPOINT_DATA);
                 uart_puts(UART_ID, (const char*) buffer);
                 st7789_put(0xFFF0);
-
-                // for (int i = 0; i < strlen((const char *)buffer); i++)
-                // {
-                //     uart_putc(UART_ID, buffer[i]);
-                //     st7789_put(0xFFF0);
-                //     tud_cdc_n_write_char(USB_ENDPOINT_DATA, buffer[i]); //
-                //     tud_cdc_write_flush();
-                // }
-
- 
-                // for (int i = 0; i < 128; i++)
-                // {
-                //     uart_putc(UART_ID, buffer[i]);
-                // }
- 
                 printf("[printf] Periodic echo - transmission \r\n");
             }
         }
